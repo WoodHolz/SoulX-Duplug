@@ -71,9 +71,17 @@ class TurnTaking:
 
     def reset(self, client_id=None):
         if self.ws:
-            self.ws.close()
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
         self.client_id = client_id or uuid.uuid4().hex
-        self.connect()
+        self._last_status = None
+        self._last_circle_status = None
+        self._last_transcription = None
+        # Do not connect here: VAD server may be down; pool release must not fail.
+        # Next process() reconnects lazily (same as first use after acquire).
 
     def process(self, audio_chunk: np.ndarray):
         if audio_chunk is None:

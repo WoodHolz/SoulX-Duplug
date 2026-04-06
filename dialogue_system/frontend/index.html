@@ -50,6 +50,19 @@
     <div class="bottom-controls">
       <button id="startBtn" class="control-btn">Start</button>
       <button id="stopBtn" class="control-btn" disabled>Stop</button>
+      <button id="exportMicBtn" class="control-btn" disabled>Export Mic WAV</button>
+      <button id="exportVadBtn" class="control-btn">Export VAD WAV</button>
+    </div>
+    <div id="audioCompareInfo" class="audio-compare-info">Mic cache: 0.00s | VAD cache: unknown</div>
+    <div class="audio-player-panel">
+      <div class="audio-player-item">
+        <span class="audio-player-label">Mic Cache Player</span>
+        <audio id="micAudioPlayer" controls preload="none"></audio>
+      </div>
+      <div class="audio-player-item">
+        <span class="audio-player-label">VAD Cache Player</span>
+        <audio id="vadAudioPlayer" controls preload="none"></audio>
+      </div>
     </div>
     <canvas id="waveformCanvas"></canvas>
   </div>

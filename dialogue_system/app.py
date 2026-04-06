@@ -3,6 +3,8 @@ import time
 import soxr
 import queue
 import base64
+import io
+import wave
 import logging
 import threading
 import uuid
@@ -52,6 +54,7 @@ class Config:
     SAMPLE_RATE = 16000
     VAD_POOL_SIZE = 10
     PORT = 55556
+    MAX_VAD_CACHE_SECONDS = 300
 
 
 class ChatSession:
@@ -73,6 +76,7 @@ class ChatSession:
         self.pending_audio_duration = 0.0
         self.pending_start_time = None
         self.interruption_time = None
+        self.vad_audio_bytes = bytearray()
 
     @property
     def stop_event(self):
@@ -92,6 +96,31 @@ class ChatSession:
     def reset_interrupt(self):
         """Creates a new stop event for the next processing cycle, leaving the old one set."""
         self._stop_event = threading.Event()
+
+    def append_vad_audio(self, int16_bytes: bytes):
+        """Cache audio that is actually fed into VAD."""
+        if not int16_bytes:
+            return
+        self.vad_audio_bytes.extend(int16_bytes)
+        max_bytes = Config.SAMPLE_RATE * 2 * Config.MAX_VAD_CACHE_SECONDS
+        if len(self.vad_audio_bytes) > max_bytes:
+            # Keep only the latest window to avoid unbounded memory growth.
+            self.vad_audio_bytes = self.vad_audio_bytes[-max_bytes:]
+
+    def clear_vad_audio(self):
+        self.vad_audio_bytes.clear()
+
+    def export_vad_audio_wav_base64(self):
+        if not self.vad_audio_bytes:
+            return None
+        with io.BytesIO() as buf:
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(Config.SAMPLE_RATE)
+                wf.writeframes(bytes(self.vad_audio_bytes))
+            wav_bytes = buf.getvalue()
+        return base64.b64encode(wav_bytes).decode("utf-8")
 
 
 class SessionManager:
@@ -386,6 +415,16 @@ async def websocket_endpoint(websocket: WebSocket):
             except WebSocketDisconnect:
                 logger.info(f"Client disconnected: {client_id}")
                 break
+            except RuntimeError as e:
+                # Starlette: second receive() after disconnect raises this
+                if "disconnect" in str(e).lower():
+                    logger.info(f"Client disconnected: {client_id}")
+                    break
+                raise
+
+            if message.get("type") == "websocket.disconnect":
+                logger.info(f"Client disconnected: {client_id}")
+                break
 
             if "bytes" in message and message["bytes"]:
                 # Binary Audio Data
@@ -401,7 +440,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         audio_chunk, current_sr, Config.SAMPLE_RATE, quality="VHQ"
                     )
 
+                audio_int16 = (
+                    np.clip(audio_chunk, -1.0, 1.0) * 32767.0
+                ).astype(np.int16, copy=False)
+
                 with session.lock:
+                    session.append_vad_audio(audio_int16.tobytes())
                     segment = session.vad.process(audio_chunk)
 
                 if segment is not None:
@@ -438,6 +482,29 @@ async def websocket_endpoint(websocket: WebSocket):
                         if sr:
                             session.input_sample_rate = int(sr)
                             logger.info(f"[{client_id}] Sample rate set to {sr}")
+                    elif event == "request_vad_audio_dump":
+                        clear_after_export = bool(
+                            payload.get("data", {}).get("clear_after_export", False)
+                        )
+                        with session.lock:
+                            duration_sec = len(session.vad_audio_bytes) / (
+                                Config.SAMPLE_RATE * 2
+                            )
+                            wav_b64 = session.export_vad_audio_wav_base64()
+                            if clear_after_export:
+                                session.clear_vad_audio()
+                        emit_to_room(
+                            client_id,
+                            "vad_audio_dump",
+                            {
+                                "sample_rate": Config.SAMPLE_RATE,
+                                "wav_base64": wav_b64,
+                                "duration_sec": duration_sec,
+                            },
+                        )
+                    elif event == "clear_vad_audio_dump":
+                        with session.lock:
+                            session.clear_vad_audio()
 
                 except json.JSONDecodeError:
                     logger.warning(f"[{client_id}] Received invalid JSON")

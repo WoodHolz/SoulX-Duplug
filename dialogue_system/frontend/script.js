@@ -1,5 +1,10 @@
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
+const exportMicBtn = document.getElementById('exportMicBtn');
+const exportVadBtn = document.getElementById('exportVadBtn');
+const audioCompareInfo = document.getElementById('audioCompareInfo');
+const micAudioPlayer = document.getElementById('micAudioPlayer');
+const vadAudioPlayer = document.getElementById('vadAudioPlayer');
 const voiceCircle = document.getElementById('voiceCircle');
 const circleStatusEl = document.getElementById('circleStatus');
 const waveformCanvas = document.getElementById('waveformCanvas');
@@ -11,6 +16,12 @@ waveformCanvas.height = 100;
 let audioContext, analyser, dataArray, source, stream, processor;
 let animationId = null;
 let listening = false;
+let micPcmChunks = [];
+let micSampleCount = 0;
+let micSampleRate = 16000;
+let lastVadCacheDurationSec = null;
+let micAudioUrl = null;
+let vadAudioUrl = null;
 
 // --- ASR Audio Context is separate from TTS Audio Context ---
 let ttsContext = null;
@@ -92,6 +103,9 @@ socket.onmessage = (event) => {
         if (ttsNode) ttsNode.port.postMessage({ type: 'resume' });
         updateCircleState('SPEAKING');
         break;
+      case 'vad_audio_dump':
+        handleVadAudioDump(payload);
+        break;
       default:
         console.log('Unknown event:', eventName);
     }
@@ -160,6 +174,100 @@ function handleUserTranscription({ text }) {
   userTranscriptionEl.textContent = displayText;
   userTranscriptionEl.classList.add("updated");
   window.setTimeout(() => userTranscriptionEl.classList.remove("updated"), 400);
+}
+
+function updateAudioCompareInfo() {
+  const micSec = micSampleRate > 0 ? (micSampleCount / micSampleRate) : 0;
+  const vadText = Number.isFinite(lastVadCacheDurationSec)
+    ? `${lastVadCacheDurationSec.toFixed(2)}s`
+    : "unknown";
+  if (audioCompareInfo) {
+    audioCompareInfo.textContent = `Mic cache: ${micSec.toFixed(2)}s | VAD cache: ${vadText}`;
+  }
+}
+
+function int16ChunksToWavBlob(chunks, sampleRate) {
+  let totalSamples = 0;
+  for (const chunk of chunks) totalSamples += chunk.length;
+
+  const wavBuffer = new ArrayBuffer(44 + totalSamples * 2);
+  const view = new DataView(wavBuffer);
+
+  function writeString(offset, str) {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  }
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + totalSamples * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM fmt chunk length
+  view.setUint16(20, 1, true); // PCM format
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  writeString(36, 'data');
+  view.setUint32(40, totalSamples * 2, true);
+
+  let offset = 44;
+  for (const chunk of chunks) {
+    for (let i = 0; i < chunk.length; i++) {
+      view.setInt16(offset, chunk[i], true);
+      offset += 2;
+    }
+  }
+
+  return new Blob([wavBuffer], { type: 'audio/wav' });
+}
+
+function triggerBlobDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function setAudioPlayerSource(player, blob, type) {
+  const nextUrl = URL.createObjectURL(blob);
+  if (type === 'mic') {
+    if (micAudioUrl) URL.revokeObjectURL(micAudioUrl);
+    micAudioUrl = nextUrl;
+  } else {
+    if (vadAudioUrl) URL.revokeObjectURL(vadAudioUrl);
+    vadAudioUrl = nextUrl;
+  }
+  player.src = nextUrl;
+  player.load();
+}
+
+function handleVadAudioDump(payload) {
+  if (!payload) return;
+  if (typeof payload.duration_sec === 'number') {
+    lastVadCacheDurationSec = payload.duration_sec;
+  }
+  updateAudioCompareInfo();
+
+  if (!payload.wav_base64) {
+    alert("Server VAD cache is empty.");
+    return;
+  }
+
+  const sampleRate = payload.sample_rate || 16000;
+  const raw = atob(payload.wav_base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  const blob = new Blob([bytes], { type: 'audio/wav' });
+  setAudioPlayerSource(vadAudioPlayer, blob, 'vad');
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  triggerBlobDownload(blob, `vad-input-${sampleRate}hz-${ts}.wav`);
 }
 
 // ==================== TTS Engine (SharedArrayBuffer + AudioWorklet) ====================
@@ -254,6 +362,7 @@ startBtn.addEventListener('click', async () => {
 
     // Separate context for recording to avoid sample rate mess
     audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    micSampleRate = audioContext.sampleRate;
 
     // Send Audio Configuration
     if (socket.readyState === WebSocket.OPEN) {
@@ -287,6 +396,9 @@ startBtn.addEventListener('click', async () => {
       for (let i = 0; i < input.length; i++) {
         int16[i] = Math.max(-1, Math.min(1, input[i])) * 0x7fff;
       }
+      micPcmChunks.push(int16);
+      micSampleCount += int16.length;
+      updateAudioCompareInfo();
 
       // Native WebSocket Send (Binary)
       if (socket.readyState === WebSocket.OPEN) {
@@ -296,6 +408,7 @@ startBtn.addEventListener('click', async () => {
 
     startBtn.disabled = true;
     stopBtn.disabled = false;
+    exportMicBtn.disabled = false;
     drawUserWaveform();
     pulseAssistantCircle();
 
@@ -328,6 +441,30 @@ stopBtn.addEventListener('click', () => {
   stopBtn.disabled = true;
   updateCircleState("READY");
 });
+
+exportMicBtn.addEventListener('click', () => {
+  if (!micPcmChunks.length) {
+    alert("No microphone audio cached yet.");
+    return;
+  }
+  const blob = int16ChunksToWavBlob(micPcmChunks, micSampleRate || 16000);
+  setAudioPlayerSource(micAudioPlayer, blob, 'mic');
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  triggerBlobDownload(blob, `mic-input-${(micSampleRate || 16000)}hz-${ts}.wav`);
+});
+
+exportVadBtn.addEventListener('click', () => {
+  if (socket.readyState !== WebSocket.OPEN) {
+    alert("WebSocket not connected.");
+    return;
+  }
+  socket.send(JSON.stringify({
+    event: "request_vad_audio_dump",
+    data: { clear_after_export: false }
+  }));
+});
+
+updateAudioCompareInfo();
 
 // ==================== Draw Waveform ====================
 function drawUserWaveform() {
